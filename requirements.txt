@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+playwright==1.58.0
+pydantic
+ 
