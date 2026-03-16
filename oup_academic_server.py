@@ -1,3 +1,4 @@
+# oup_academic_server.py
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI + Playwright — Scraper de precios Oxford University Press (Academic)
 # Arranque:
@@ -13,7 +14,7 @@ from typing import Optional, List, Dict, Any
 
 app = FastAPI(
     title="Oxford University Press — Academic Price Scraper",
-    version="5.0.0",
+    version="6.0.0",
 )
 
 _pw      = None
@@ -24,20 +25,6 @@ sem      = asyncio.Semaphore(3)
 
 def clean_isbn(isbn: str) -> str:
     return (isbn or "").strip().replace(" ", "").replace("-", "")
-
-
-def normalize_price(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    m = re.search(r"(\d{1,4}(?:[.,]\d{2,3})?)", text)
-    return m.group(1).replace(",", ".") if m else None
-
-
-def extract_currency(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    m = re.search(r"([£$€])", text)
-    return m.group(1) if m else None
 
 
 # ─── Lifecycle ───────────────────────────────────────────────────────────────
@@ -74,16 +61,23 @@ async def shutdown():
 # ─── Cookies ─────────────────────────────────────────────────────────────────
 
 async def accept_cookies(page) -> None:
-    """
-    <button id="onetrust-accept-btn-handler">Accept all cookies</button>
-    """
     try:
         btn = page.locator("#onetrust-accept-btn-handler")
-        await btn.wait_for(state="visible", timeout=5_000)
-        await btn.click(timeout=3_000)
-        await page.wait_for_timeout(500)
+        await btn.wait_for(state="visible", timeout=3_000)
+        await btn.click(timeout=2_000)
+        await page.wait_for_timeout(300)
     except Exception:
         pass
+
+
+# ─── Resultado vacío ─────────────────────────────────────────────────────────
+
+def empty_result(isbn: str) -> Dict[str, Any]:
+    """ISBN no encontrado → campos en blanco, sin error largo."""
+    return {
+        "isbn": isbn, "title": None, "price": None,
+        "currency": None, "url": None, "error": None,
+    }
 
 
 # ─── Scraping core ───────────────────────────────────────────────────────────
@@ -93,121 +87,68 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
     isbn = clean_isbn(isbn)
 
     if not (10 <= len(isbn) <= 13) or not isbn.isdigit():
-        return {
-            "isbn": isbn, "title": None, "price": None,
-            "currency": None, "url": "",
-            "error": "ISBN inválido (debe tener 10-13 dígitos numéricos)",
-        }
+        return empty_result(isbn)
 
     search_url = f"https://global.oup.com/academic/search?q={isbn}&cc=es&lang=en"
 
     async with sem:
         page = await _context.new_page()
         try:
-            # ── 1. Navegar a la búsqueda directa ────────────────────────
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
-
-            # ── 2. Aceptar cookies ───────────────────────────────────────
+            # ── 1. Navegar ───────────────────────────────────────────────
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
             await accept_cookies(page)
 
-            # ── 3. Esperar a que cargue el contenido ─────────────────────
-            #    Esperar a que el DOM se estabilice
-            await page.wait_for_timeout(2000)
-
-            # ── 4. Verificar si estamos en la página de producto ─────────
+            # ── 2. ¿Estamos en la página de producto? ────────────────────
             product_loaded = False
             try:
-                h1 = page.locator("h1.product_biblio_title").first
-                await h1.wait_for(timeout=8_000)
+                await page.locator("h1.product_biblio_title").first.wait_for(timeout=6_000)
                 product_loaded = True
             except Exception:
                 pass
 
-            # ── 5. Si no, buscar enlace al producto en resultados ────────
+            # ── 3. Si no, clic en resultado ──────────────────────────────
             if not product_loaded:
                 try:
                     link = page.locator(f"a[href*='{isbn}']").first
                     if await link.count() > 0:
-                        await link.click(timeout=10_000)
+                        await link.click(timeout=5_000)
                         await page.wait_for_load_state("domcontentloaded")
                         await accept_cookies(page)
-                        await page.wait_for_timeout(2000)
                         try:
-                            await page.locator("h1.product_biblio_title").first.wait_for(timeout=8_000)
+                            await page.locator("h1.product_biblio_title").first.wait_for(timeout=6_000)
                             product_loaded = True
                         except Exception:
                             pass
                 except Exception:
                     pass
 
+            # No encontrado → resultado vacío, no perder más tiempo
             if not product_loaded:
-                try:
-                    link = page.locator("a[href*='/academic/product/']").first
-                    if await link.count() > 0:
-                        await link.click(timeout=10_000)
-                        await page.wait_for_load_state("domcontentloaded")
-                        await accept_cookies(page)
-                        await page.wait_for_timeout(2000)
-                        try:
-                            await page.locator("h1.product_biblio_title").first.wait_for(timeout=8_000)
-                            product_loaded = True
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-            # ── Verificar Amazon redirect ────────────────────────────────
-            if "amazon" in page.url:
-                return {
-                    "isbn": isbn, "title": None, "price": None,
-                    "currency": None, "url": page.url,
-                    "error": "Redirigió a Amazon",
-                }
-
-            if not product_loaded:
-                return {
-                    "isbn": isbn, "title": None, "price": None,
-                    "currency": None, "url": page.url,
-                    "error": "Producto no encontrado para este ISBN",
-                }
+                return empty_result(isbn)
 
             # ═════════════════════════════════════════════════════════════
-            # EXTRACCIÓN — Esperar explícitamente a cada elemento
+            # EXTRACCIÓN
             # ═════════════════════════════════════════════════════════════
 
-            # ── TÍTULO ───────────────────────────────────────────────────
-            # <h1 itemprop="name" class="product_biblio_title">
+            # TÍTULO: h1.product_biblio_title
             title = None
             try:
-                h1 = page.locator("h1.product_biblio_title").first
-                await h1.wait_for(timeout=5_000)
-                title = (await h1.inner_text(timeout=5_000)).strip()
+                title = (await page.locator("h1.product_biblio_title").first
+                         .inner_text(timeout=3_000)).strip()
             except Exception:
                 pass
 
-            # ── PRECIO ───────────────────────────────────────────────────
-            # <span itemprop="price">7.99</span>
+            # PRECIO: span[itemprop="price"]
             price = None
             try:
                 ps = page.locator('span[itemprop="price"]').first
-                await ps.wait_for(timeout=10_000)
-                raw = (await ps.inner_text(timeout=5_000)).strip()
+                await ps.wait_for(timeout=5_000)
+                raw = (await ps.inner_text(timeout=3_000)).strip()
                 if raw:
                     price = raw.replace(",", ".")
             except Exception:
                 pass
 
-            # Fallback: p.product_price
-            if not price:
-                try:
-                    pp = page.locator("p.product_price").first
-                    await pp.wait_for(timeout=5_000)
-                    raw = (await pp.inner_text(timeout=5_000)).strip()
-                    price = normalize_price(raw)
-                except Exception:
-                    pass
-
-            # Fallback: regex en HTML
             if not price:
                 try:
                     html = await page.content()
@@ -217,12 +158,11 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-            # ── MONEDA ───────────────────────────────────────────────────
-            # <span itemprop="priceCurrency" content="GBP">
+            # MONEDA: span[itemprop="priceCurrency"] content="GBP"
             currency = None
             try:
-                cs = page.locator('span[itemprop="priceCurrency"]').first
-                code = await cs.get_attribute("content", timeout=3_000)
+                code = await page.locator('span[itemprop="priceCurrency"]').first \
+                    .get_attribute("content", timeout=2_000)
                 if code:
                     currency = {"GBP": "£", "USD": "$", "EUR": "€"}.get(
                         code.strip(), code.strip()
@@ -230,16 +170,7 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            if not currency:
-                try:
-                    pp = page.locator("p.product_price").first
-                    txt = (await pp.inner_text(timeout=3_000)).strip()
-                    currency = extract_currency(txt)
-                except Exception:
-                    pass
-
-            # ── ISBN ─────────────────────────────────────────────────────
-            # <p>ISBN: 9780199537006</p>
+            # ISBN: <p>ISBN: XXXXX</p>
             page_isbn = isbn
             try:
                 sidebar_ps = page.locator("div.content_right.product_sidebar p")
@@ -257,32 +188,14 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            # ── Resultado ────────────────────────────────────────────────
-            if not price:
-                return {
-                    "isbn": page_isbn, "title": title, "price": None,
-                    "currency": None, "url": page.url,
-                    "error": "Precio no encontrado en la página",
-                }
-
             return {
                 "isbn": page_isbn, "title": title,
                 "price": price, "currency": currency,
                 "url": page.url, "error": None,
             }
 
-        except PlaywrightTimeoutError:
-            return {
-                "isbn": isbn, "title": None, "price": None,
-                "currency": None, "url": search_url,
-                "error": f"Timeout ({isbn})",
-            }
-        except Exception as e:
-            return {
-                "isbn": isbn, "title": None, "price": None,
-                "currency": None, "url": search_url,
-                "error": str(e),
-            }
+        except (PlaywrightTimeoutError, Exception):
+            return empty_result(isbn)
         finally:
             await page.close()
 
@@ -293,8 +206,7 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
 async def root():
     return {
         "message": "OUP Academic Scraper API running",
-        "docs": "/docs", "health": "/health",
-        "test": "/test",
+        "docs": "/docs",
         "example": "/oup/academic?isbn=9780199537006",
     }
 
@@ -309,7 +221,7 @@ async def health():
 
 @app.get("/version")
 async def version():
-    return {"version": "5.0.0", "source": "oup_academic"}
+    return {"version": "6.0.0"}
 
 
 class OUPAcademicResult(BaseModel):
@@ -317,7 +229,7 @@ class OUPAcademicResult(BaseModel):
     title: Optional[str]
     price: Optional[str]
     currency: Optional[str]
-    url: str
+    url: Optional[str]
     error: Optional[str]
 
 
@@ -360,10 +272,7 @@ async def oup_academic_batch(req: BatchRequest):
     final: List[Dict[str, Any]] = []
     for isbn, r in zip(isbns, results):
         if isinstance(r, Exception):
-            final.append({
-                "isbn": isbn, "title": None, "price": None,
-                "currency": None, "url": "", "error": str(r),
-            })
+            final.append(empty_result(isbn))
         else:
             final.append(r)
 
