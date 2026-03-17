@@ -75,7 +75,7 @@ async def accept_cookies(page) -> None:
 def empty_result(isbn: str) -> Dict[str, Any]:
     """ISBN no encontrado → campos en blanco, sin error largo."""
     return {
-        "isbn": isbn, "title": None, "price": None,
+        "isbn": isbn, "title": None, "price": "-",
         "currency": None, "url": None, "error": None,
     }
 
@@ -190,7 +190,7 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
 
             return {
                 "isbn": page_isbn, "title": title,
-                "price": price, "currency": currency,
+                "price": price if price else "-", "currency": currency,
                 "url": page.url, "error": None,
             }
 
