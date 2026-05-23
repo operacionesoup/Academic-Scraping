@@ -46,8 +46,8 @@ _context = None
 # Las cookies persisten en _context: sólo hay que aceptarlas una vez
 _cookies_accepted = False
 
-# n8n envía 1 ISBN por llamada (batchSize=1). Semaphore=3 para peticiones directas.
-sem = asyncio.Semaphore(3)
+# n8n envía lotes de 5 ISBNs por llamada. Semaphore=5 para procesarlos en paralelo.
+sem = asyncio.Semaphore(5)
 
 BASE_URL   = "https://global.oup.com/academic/?lang=en&cc=gb"
 # Ir directamente a búsqueda evita cargar la home + interactuar con el formulario
