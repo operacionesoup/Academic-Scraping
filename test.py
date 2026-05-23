@@ -3,12 +3,11 @@
 # FastAPI + Playwright — Scraper de precios Oxford University Press (Academic)
 #
 # Estrategia:
-#   1. Navega a https://global.oup.com/academic/?lang=en&cc=es
-#   2. Acepta cookies
-#   3. Escribe el ISBN en el buscador  input[name="q"]
-#   4. Hace clic en el botón Search    input#tab_search_submit
-#   5. En los resultados, clic en el enlace del producto
-#   6. Extrae título, precio, moneda e ISBN de la página de producto
+#   1. Va directamente a la URL de búsqueda con el ISBN (sin pasar por la home)
+#   2. Acepta cookies (sólo la primera vez por proceso — persisten en el contexto)
+#   3. Bloquea imágenes / fuentes / CSS para acelerar la carga
+#   4. En los resultados, clic en el enlace del producto
+#   5. Extrae título, precio, moneda e ISBN de la página de producto
 #
 # Selectores DevTools (página de producto):
 #   Título:  h1.product_biblio_title
@@ -36,7 +35,7 @@ from typing import Optional, List, Dict, Any
 app = FastAPI(
     title="Oxford University Press — Academic Price Scraper",
     description="Obtiene el precio, título e ISBN de libros en global.oup.com/academic a partir de su ISBN.",
-    version="3.0.0",
+    version="4.0.0",
 )
 
 # ─── Estado global del navegador ─────────────────────────────────────────────
@@ -44,11 +43,18 @@ _pw      = None
 _browser = None
 _context = None
 
-# Máximo 2 páginas simultáneas para no saturar
-sem = asyncio.Semaphore(2)
+# Las cookies persisten en _context: sólo hay que aceptarlas una vez
+_cookies_accepted = False
 
-# URL base de OUP Academic
-BASE_URL = "https://global.oup.com/academic/?lang=en&cc=es"
+# n8n envía 1 ISBN por llamada (batchSize=1). Semaphore=3 para peticiones directas.
+sem = asyncio.Semaphore(3)
+
+BASE_URL   = "https://global.oup.com/academic/?lang=en&cc=gb"
+# Ir directamente a búsqueda evita cargar la home + interactuar con el formulario
+SEARCH_URL = "https://global.oup.com/academic/search/?q={isbn}&lang=en&cc=gb"
+
+# Tipos de recurso que no necesitamos: bloquearlos acelera la carga ~40%
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
 
 
 # ─── Utilidades ─────────────────────────────────────────────────────────────
@@ -110,50 +116,44 @@ async def shutdown():
 
 # ─── Helpers de página ───────────────────────────────────────────────────────
 
+async def _block_resources(route, request) -> None:
+    if request.resource_type in BLOCKED_RESOURCE_TYPES:
+        await route.abort()
+    else:
+        await route.continue_()
+
+
 async def accept_cookies(page) -> None:
     """
-    Cierra el banner de cookies de OUP Academic.
-    Botón: "Aceptar todas las cookies"
+    Acepta el banner de cookies de OUP Academic.
+    Sólo actúa si todavía no se aceptaron en este proceso
+    (las cookies persisten en el contexto compartido).
     """
-    for _ in range(5):
+    global _cookies_accepted
+    if _cookies_accepted:
+        return
+
+    for selector in [
+        "#onetrust-accept-btn-handler",
+        "button:has-text('Aceptar todas las cookies')",
+        "button:has-text('Accept All Cookies')",
+    ]:
         try:
-            btn = page.locator("button:has-text('Aceptar todas las cookies')").first
-            if await btn.count() > 0 and await btn.is_visible():
-                await btn.click(timeout=3000)
-                await page.wait_for_timeout(500)
+            btn = page.locator(selector).first
+            if await btn.count() > 0 and await btn.is_visible(timeout=2_000):
+                await btn.click(timeout=3_000)
+                _cookies_accepted = True
                 return
         except Exception:
-            pass
-
-        try:
-            btn = page.get_by_role(
-                "button",
-                name=re.compile(r"(accept all|aceptar todas|accept|aceptar)", re.I)
-            ).first
-            if await btn.count() > 0:
-                await btn.click(timeout=3000)
-                await page.wait_for_timeout(500)
-                return
-        except Exception:
-            pass
-
-        try:
-            btn = page.locator("#onetrust-accept-btn-handler").first
-            if await btn.count() > 0 and await btn.is_visible():
-                await btn.click(timeout=3000)
-                await page.wait_for_timeout(500)
-                return
-        except Exception:
-            pass
-
-        await page.wait_for_timeout(1000)
+            continue
 
 
 # ─── Scraping core ───────────────────────────────────────────────────────────
 
 async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
     """
-    Scrapea un producto de global.oup.com/academic usando el buscador.
+    Scrapea un producto de global.oup.com/academic yendo directamente
+    a la URL de búsqueda (sin pasar por la home page).
     """
     global _context
     isbn = clean_isbn(isbn)
@@ -167,87 +167,41 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
 
     async with sem:
         page = await _context.new_page()
+        # Bloquear recursos innecesarios antes de cualquier navegación
+        await page.route("**/*", _block_resources)
         try:
             # ═════════════════════════════════════════════════════════════
-            # PASO 1: Navegar a la página principal de OUP Academic
+            # PASO 1: Ir directamente a la página de resultados de búsqueda
+            # Evita cargar la home + interactuar con el formulario (~7s)
             # ═════════════════════════════════════════════════════════════
-            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(2000)
+            await page.goto(
+                SEARCH_URL.format(isbn=isbn),
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
 
             # ═════════════════════════════════════════════════════════════
-            # PASO 2: Aceptar cookies
+            # PASO 2: Aceptar cookies (no-op si ya se aceptaron)
             # ═════════════════════════════════════════════════════════════
             await accept_cookies(page)
 
             # ═════════════════════════════════════════════════════════════
-            # PASO 3: Escribir el ISBN en el buscador
-            # DevTools: <input name="q" type="text" class="default_text">
+            # PASO 3: Navegar al producto
+            # Puede que el buscador aterrice directamente en el producto
+            # o en una lista de resultados.
             # ═════════════════════════════════════════════════════════════
-            search_input = page.locator('input[name="q"]').first
-            await search_input.wait_for(timeout=10_000)
-            # Limpiar el campo (puede tener placeholder text)
-            await search_input.click()
-            await search_input.fill("")
-            await search_input.fill(isbn)
-            await page.wait_for_timeout(500)
+            product_loaded = await page.locator("h1.product_biblio_title").count() > 0
 
-            # ═════════════════════════════════════════════════════════════
-            # PASO 4: Hacer clic en el botón Search
-            # DevTools: <input id="tab_search_submit" class="simple_search_submit"
-            #            type="submit" value="Search">
-            # ═════════════════════════════════════════════════════════════
-            search_btn = page.locator("input#tab_search_submit").first
-            await search_btn.click(timeout=5_000)
-
-            # Esperar a que cargue la página de resultados o producto
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(3000)
-
-            # Aceptar cookies de nuevo si aparecen tras la navegación
-            await accept_cookies(page)
-
-            # ═════════════════════════════════════════════════════════════
-            # PASO 5: Verificar si estamos en la página de producto
-            #         o en la lista de resultados de búsqueda
-            # ═════════════════════════════════════════════════════════════
-            product_loaded = False
-
-            # Verificar si ya estamos en la página de producto
-            try:
-                h1 = page.locator("h1.product_biblio_title").first
-                if await h1.count() > 0:
-                    product_loaded = True
-            except Exception:
-                pass
-
-            # Si no estamos en el producto, buscar el enlace en resultados
             if not product_loaded:
-                try:
-                    # Buscar enlace que contenga el ISBN en su href
-                    result_link = page.locator(f"a[href*='{isbn}']").first
-                    if await result_link.count() > 0:
-                        await result_link.click(timeout=10_000)
+                for selector in [f"a[href*='{isbn}']", "a[href*='/academic/product/']"]:
+                    link = page.locator(selector).first
+                    if await link.count() > 0:
+                        await link.click(timeout=10_000)
                         await page.wait_for_load_state("domcontentloaded")
-                        await page.wait_for_timeout(3000)
                         await accept_cookies(page)
                         product_loaded = True
-                except Exception:
-                    pass
+                        break
 
-            # Si sigue sin cargar, intentar con un enlace de producto genérico
-            if not product_loaded:
-                try:
-                    result_link = page.locator("a[href*='/academic/product/']").first
-                    if await result_link.count() > 0:
-                        await result_link.click(timeout=10_000)
-                        await page.wait_for_load_state("domcontentloaded")
-                        await page.wait_for_timeout(3000)
-                        await accept_cookies(page)
-                        product_loaded = True
-                except Exception:
-                    pass
-
-            # ── Verificar que NO estamos en Amazon ───────────────────────
             if "amazon" in page.url:
                 return {
                     "isbn": isbn, "title": None, "price": None,
@@ -255,12 +209,9 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
                     "error": "Redirigió a Amazon",
                 }
 
-            # ── Verificar que encontramos algo ───────────────────────────
             if not product_loaded:
-                # Último intento: verificar si h1 existe de todas formas
                 try:
-                    h1 = page.locator("h1.product_biblio_title").first
-                    await h1.wait_for(timeout=5_000)
+                    await page.locator("h1.product_biblio_title").first.wait_for(timeout=5_000)
                     product_loaded = True
                 except Exception:
                     return {
@@ -270,26 +221,21 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
                     }
 
             # ═════════════════════════════════════════════════════════════
-            # PASO 6: EXTRACCIÓN DE DATOS — Selectores exactos DevTools
+            # PASO 4: EXTRACCIÓN DE DATOS
             # ═════════════════════════════════════════════════════════════
 
             # ── TÍTULO ───────────────────────────────────────────────────
-            # <h1 itemprop="name" class="product_biblio_title">
             title = None
             try:
-                h1 = page.locator("h1.product_biblio_title").first
-                title = (await h1.inner_text(timeout=5_000)).strip()
+                title = (await page.locator("h1.product_biblio_title").first.inner_text(timeout=5_000)).strip()
             except Exception:
                 try:
-                    h1 = page.locator('h1[itemprop="name"]').first
-                    title = (await h1.inner_text(timeout=5_000)).strip()
+                    title = (await page.locator('h1[itemprop="name"]').first.inner_text(timeout=5_000)).strip()
                 except Exception:
                     pass
 
             # ── PRECIO ───────────────────────────────────────────────────
-            # <span itemprop="price">7.99</span>
             price = None
-
             try:
                 ps = page.locator('span[itemprop="price"]').first
                 await ps.wait_for(timeout=10_000)
@@ -301,8 +247,7 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
 
             if not price:
                 try:
-                    pp = page.locator("p.product_price").first
-                    raw = (await pp.inner_text(timeout=5_000)).strip()
+                    raw = (await page.locator("p.product_price").first.inner_text(timeout=5_000)).strip()
                     price = normalize_price(raw)
                 except Exception:
                     pass
@@ -317,34 +262,28 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
                     pass
 
             # ── MONEDA ───────────────────────────────────────────────────
-            # <span id="structured-data-currency" itemprop="priceCurrency" content="GBP">
             currency = None
-
             try:
-                cs = page.locator('span[itemprop="priceCurrency"]').first
-                code = await cs.get_attribute("content", timeout=3_000)
+                code = await page.locator('span[itemprop="priceCurrency"]').first.get_attribute(
+                    "content", timeout=3_000
+                )
                 if code:
-                    currency = {"GBP": "£", "USD": "$", "EUR": "€"}.get(
-                        code.strip(), code.strip()
-                    )
+                    currency = {"GBP": "£", "USD": "$", "EUR": "€"}.get(code.strip(), code.strip())
             except Exception:
                 pass
 
             if not currency:
                 try:
-                    pp = page.locator("p.product_price").first
-                    txt = (await pp.inner_text(timeout=3_000)).strip()
+                    txt = (await page.locator("p.product_price").first.inner_text(timeout=3_000)).strip()
                     currency = extract_currency(txt)
                 except Exception:
                     pass
 
             # ── ISBN (desde la página) ───────────────────────────────────
-            # <p>ISBN: 9780199537006</p>
             page_isbn = isbn
             try:
                 sidebar_ps = page.locator("div.content_right.product_sidebar p")
-                count = await sidebar_ps.count()
-                for i in range(count):
+                for i in range(await sidebar_ps.count()):
                     try:
                         txt = (await sidebar_ps.nth(i).inner_text(timeout=2_000)).strip()
                         if txt.startswith("ISBN:"):
@@ -414,7 +353,7 @@ async def health():
 
 @app.get("/version")
 async def version():
-    return {"version": "3.0.0", "source": "oup_academic"}
+    return {"version": "4.0.0", "source": "oup_academic"}
 
 
 class OUPAcademicResult(BaseModel):
