@@ -193,14 +193,13 @@ async def scrape_academic_one(isbn: str) -> Dict[str, Any]:
             product_loaded = await page.locator("h1.product_biblio_title").count() > 0
 
             if not product_loaded:
-                for selector in [f"a[href*='{isbn}']", "a[href*='/academic/product/']"]:
-                    link = page.locator(selector).first
-                    if await link.count() > 0:
-                        await link.click(timeout=10_000)
-                        await page.wait_for_load_state("domcontentloaded")
-                        await accept_cookies(page)
-                        product_loaded = True
-                        break
+                # Solo clic en links que contienen el ISBN exacto
+                link = page.locator(f"a[href*='{isbn}']").first
+                if await link.count() > 0:
+                    await link.click(timeout=10_000)
+                    await page.wait_for_load_state("domcontentloaded")
+                    await accept_cookies(page)
+                    product_loaded = True
 
             if "amazon" in page.url:
                 return {
