@@ -51,7 +51,7 @@ sem = asyncio.Semaphore(5)
 
 BASE_URL   = "https://global.oup.com/academic/?lang=en&cc=gb"
 # Ir directamente a búsqueda evita cargar la home + interactuar con el formulario
-SEARCH_URL = "https://global.oup.com/academic/search/?q={isbn}&lang=en&cc=gb"
+SEARCH_URL = "https://global.oup.com/academic/search?q={isbn}&lang=en&cc=es"
 
 # Tipos de recurso que no necesitamos: bloquearlos acelera la carga ~40%
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
